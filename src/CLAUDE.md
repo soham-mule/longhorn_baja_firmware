@@ -1,5 +1,19 @@
 # longhorn_baja_firmware
 
+> ⚠️ **Superseded in part (2026-09).** The authoritative design is the
+> *Baja Sensor ECU: Firmware Specification and Handoff* in this directory,
+> with one hardware amendment: the IMU on the ECU's I2C header is the
+> **MPU6050** (0x68 on **GP0/GP1**, ±16 g / ±1000 °/s, raw counts), not the
+> BNO055 the spec describes — see docs/pinmap.md. Everything else stands:
+> microSD on SPI0 GP2–GP5, GT-U7 GPS on UART1 GP12/GP13, and **no fusion on
+> target** (log raw, filter offline in Python; record contract v2 in
+> `record.h`). The default `pico` env builds that datalogger (`main.cpp`,
+> `mpu6050.*`, `gps.*`, `logger.*`, `record.h`). The old GP4/GP5 IMU wiring
+> below is bench-only (`pico_imu_test`) — those pins are SD lines on the
+> ECU board. The EKF material applies to the offline filter and the
+> `pico_ekf` bench env. The coding constraints (floats, allocation,
+> blocking, timing, types, ISRs) remain in force everywhere.
+
 Data acquisition firmware for a Baja SAE vehicle. IMU → sensor fusion → logging → telemetry.
 
 Longer background, rationale and teaching material live in `EMBEDDED_GUIDE.md`. This file is the operational contract.

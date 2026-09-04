@@ -1,335 +1,203 @@
-// Vehicle firmware entry point: samples the MPU6050, runs the error-state
-// KF, prints summary telemetry. Owns setup()/loop() -- no other file in
-// the `pico` env may define them.
+// Baja Sensor ECU datalogger -- Longhorn Baja Racing, car 185.
+// Samples an MPU6050 at a fixed 100 Hz, drains GPS NMEA continuously,
+// timestamps both on the micros() clock, and writes fixed-size binary
+// records to microSD. No fusion, no filtering on target: raw counts are
+// logged here, filtering happens offline (analysis/parse_log.py).
 //
-// Wiring (I2C0, same as mpu6050_test.cpp):
-//   MPU6050 VCC -> 3V3(OUT)  physical pin 36  (never VBUS)
-//   MPU6050 GND -> GND       physical pin 38
-//   MPU6050 SDA -> GP4       physical pin 6
-//   MPU6050 SCL -> GP5       physical pin 7
-//   AD0 low -> address 0x68
+// Pin map (docs/pinmap.md):
+//   MPU6050 SDA -> GP0 (I2C0 SDA)   SCL -> GP1 (I2C0 SCL)   addr 0x68
+//     The MPU6050 breakout sits on the ECU board's 1x6 IMU header, which
+//     routes I2C0 to GP0/GP1. Do NOT use the old breadboard wiring
+//     (GP4/GP5): those pins are the SD card's MISO/CS on this board.
+//   microSD SCK -> GP2, MOSI -> GP3, MISO -> GP4, CS -> GP5 (SPI0)
+//   GPS     module TX -> GP13 (UART1 RX), module RX -> GP12 (UART1 TX)
+//     Module: GT-U7 (u-blox NEO-6M compatible), NMEA at 9600 baud.
+//   Status LED: onboard GP25
 //
-// Mounting / frames: the filter runs in NED (Z down, gravity +9.80665).
-// The MPU6050 axes are remapped to a front-right-down body frame assuming
-// the breakout is mounted component-side up with its +X axis pointing
-// forward:  x_b = +x_imu, y_b = -y_imu, z_b = -z_imu.
-// If the board is mounted differently, change remap_to_body() only.
+// Startup behaviour, decided and documented: a missing SD card or
+// missing IMU HALTS with a distinct blink pattern. A run that logs
+// nothing is worse than a run that does not start, and the driver must
+// see the fault before rolling out.
+//   normal logging : 1 Hz heartbeat blink
+//   SD failure     : fast continuous blink (~8 Hz)
+//   IMU failure    : double-flash, pause, repeat
 
 #include <Arduino.h>
 #include <Wire.h>
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
 #include <hardware/watchdog.h>
+#include <pico/rand.h>
 
-#include "ekf.h"
-#include "ekf_predict.h"
+#include "mpu6050.h"
+#include "gps.h"
+#include "logger.h"
+#include "record.h"
 
-// ---------------------------------------------------------------- config
+static const uint8_t kPinSda = 0;
+static const uint8_t kPinScl = 1;
+static const uint8_t kMpuAddr = 0x68;  // 0x69 if AD0 is tied high
+static const uint32_t kI2cHz = 400000;
 
-static const uint8_t kPinSda = 4;
-static const uint8_t kPinScl = 5;
-static const uint8_t kMpuAddr = 0x68;
-
-static const uint32_t kSamplePeriodUs = 10000;   // 100 Hz IMU + predict
-static const uint32_t kZuptPeriodUs   = 100000;  // 10 Hz while stationary
-static const uint32_t kTelemPeriodUs  = 200000;  // 5 Hz status line
-static const uint32_t kInitRetryUs    = 500000;  // IMU re-probe when absent
-
-static const uint16_t kCalibSamples = 200;       // 2 s of standstill
-// Motion guards during calibration: restart if exceeded.
-static const float kCalibGyroSpread = 0.05f;     // rad/s per-axis max-min
-static const float kCalibAccelTol   = 1.0f;      // m/s^2 from |g|
-
-// Standstill detector for ZUPT (bias-corrected thresholds).
-static const float kStillGyroMax  = 0.03f;       // rad/s
-static const float kStillAccelTol = 0.3f;        // m/s^2 from |g|
-static const uint16_t kStillCount = 50;          // consecutive samples (0.5 s)
-
+static const uint32_t kSamplePeriodUs = 10000;  // 100 Hz
+static const uint32_t kStatusPeriodUs = 1000000;
 static const uint32_t kWatchdogMs = 4000;
 
-// Arduino's RAD_TO_DEG is a double literal; using it would promote every
-// product to double math (no FPU -- see CLAUDE.md).
-static const float kRadToDeg = 57.29577951f;
+static const uint8_t kPinLed = LED_BUILTIN;
 
-// ---------------------------------------------------------------- state
+static uint32_t next_us = 0;
+static uint32_t status_next_us = 0;
+static uint32_t sample_count = 0;
+static uint32_t imu_fail_count = 0;
+static uint32_t imu_fail_streak = 0;
+static uint8_t seq = 0;
+static Mpu6050Sample imu;  // last good reading, logged stale on failure
 
-static Adafruit_MPU6050 mpu;
-static ekf::Filter filter;
-
-enum class Mode : uint8_t { kImuProbe, kCalibrating, kRunning };
-static Mode mode = Mode::kImuProbe;
-static bool imu_configured = false;
-
-static uint32_t last_sample_us = 0;
-static uint32_t last_zupt_us = 0;
-static uint32_t last_telem_us = 0;
-static uint32_t last_probe_us = 0;
-static uint32_t prev_read_us = 0;
-static bool have_prev_read = false;
-
-// Calibration accumulators.
-static uint16_t calib_n = 0;
-static ekf::Vec3 calib_sum_w = ekf::Vec3::Zero();
-static ekf::Vec3 calib_sum_f = ekf::Vec3::Zero();
-static ekf::Vec3 calib_min_w = ekf::Vec3::Zero();
-static ekf::Vec3 calib_max_w = ekf::Vec3::Zero();
-
-// Diagnostics.
-static uint16_t still_counter = 0;
-static uint32_t read_failures = 0;
-static uint32_t filter_resets = 0;
-static uint32_t dt_rejects = 0;
-static uint32_t predict_us_max = 0;
-static uint32_t predict_us_sum = 0;
-static uint32_t predict_count = 0;
-
-// ---------------------------------------------------------------- helpers
-
-// Sensor frame -> FRD body frame (see mounting note in the header).
-static ekf::Vec3 remap_to_body(float x, float y, float z)
+// Blocking halt with a blink pattern. Only reachable before the watchdog
+// is armed, so the pattern persists until someone power cycles.
+static void halt_blink(uint16_t on_ms, uint16_t off_ms, uint8_t pulses,
+                       uint16_t gap_ms)
 {
-    return ekf::Vec3(x, -y, -z);
-}
-
-static void start_calibration()
-{
-    calib_n = 0;
-    calib_sum_w.setZero();
-    calib_sum_f.setZero();
-    still_counter = 0;
-    mode = Mode::kCalibrating;
-    Serial.println("calibrating: hold still ~2 s");
-}
-
-// Try to bring the IMU up. Called from setup() once and then re-tried
-// from loop() -- deployed firmware degrades and retries, never halts.
-static bool probe_imu()
-{
-    if (!mpu.begin(kMpuAddr, &Wire)) return false;
-
-    // Vehicle ranges: a Baja car clips +/-2 g instantly and the filter
-    // would ingest the clipped data with full confidence.
-    mpu.setAccelerometerRange(MPU6050_RANGE_16_G);
-    mpu.setGyroRange(MPU6050_RANGE_1000_DEG);
-    mpu.setFilterBandwidth(MPU6050_BAND_44_HZ);  // < Nyquist of 100 Hz
-    imu_configured = true;
-    return true;
-}
-
-// One IMU read, remapped to the body frame. Returns false on bus failure.
-static bool read_imu(ekf::Vec3& f_b, ekf::Vec3& w_b, uint32_t& t_us)
-{
-    sensors_event_t accel, gyro, temp;
-    if (!mpu.getEvent(&accel, &gyro, &temp)) return false;
-    t_us = micros();
-    // Unified Sensor API already reports m/s^2 and rad/s -- fed to the
-    // filter unconverted (SI internally, always).
-    f_b = remap_to_body(accel.acceleration.x, accel.acceleration.y,
-                        accel.acceleration.z);
-    w_b = remap_to_body(gyro.gyro.x, gyro.gyro.y, gyro.gyro.z);
-    return true;
-}
-
-static void calibration_step(const ekf::Vec3& f_b, const ekf::Vec3& w_b)
-{
-    if (calib_n == 0) {
-        calib_min_w = w_b;
-        calib_max_w = w_b;
-    }
-    calib_min_w = calib_min_w.cwiseMin(w_b);
-    calib_max_w = calib_max_w.cwiseMax(w_b);
-    calib_sum_w += w_b;
-    calib_sum_f += f_b;
-    calib_n++;
-
-    // Motion guard: a calibration taken while moving poisons the bias
-    // estimate, so restart rather than average it in.
-    const bool moving =
-        (calib_max_w - calib_min_w).maxCoeff() > kCalibGyroSpread ||
-        fabsf(f_b.norm() - ekf::kGravity) > kCalibAccelTol;
-    if (moving) {
-        start_calibration();
-        return;
-    }
-
-    if (calib_n >= kCalibSamples) {
-        const float inv_n = 1.0f / (float)calib_n;
-        const ekf::Vec3 bg = calib_sum_w * inv_n;
-        const ekf::Vec3 f_mean = calib_sum_f * inv_n;
-
-        filter.reset();
-        filter.set_gyro_bias(bg);
-        filter.init_attitude_from_accel(f_mean);
-
-        have_prev_read = false;  // first dt after calibration is invalid
-        mode = Mode::kRunning;
-        Serial.println("calibration done");
+    pinMode(kPinLed, OUTPUT);
+    while (true) {
+        for (uint8_t i = 0; i < pulses; i++) {
+            digitalWrite(kPinLed, HIGH);
+            delay(on_ms);
+            digitalWrite(kPinLed, LOW);
+            delay(off_ms);
+        }
+        delay(gap_ms);
     }
 }
 
-static void running_step(const ekf::Vec3& f_b, const ekf::Vec3& w_b,
-                         uint32_t t_us)
+static void take_sample()
 {
-    // dt from measured timestamps, never the nominal rate. Unsigned
-    // subtraction survives the ~71.6 min micros() rollover.
-    if (!have_prev_read) {
-        prev_read_us = t_us;
-        have_prev_read = true;
-        return;
-    }
-    const float dt = (float)(t_us - prev_read_us) * 1e-6f;
-    prev_read_us = t_us;
+    const uint32_t t_us = micros();
 
-    const uint32_t t0 = micros();
-    if (!filter.predict(f_b, w_b, dt)) {
-        dt_rejects++;
-        return;
-    }
-    const uint32_t cost = micros() - t0;
-    predict_us_sum += cost;
-    predict_count++;
-    if (cost > predict_us_max) predict_us_max = cost;
-
-    // Gravity attitude update every 4th sample (25 Hz); gated inside.
-    static uint8_t decim = 0;
-    if (++decim >= 4) {
-        decim = 0;
-        filter.update_accel(f_b);
-    }
-
-    // Standstill detector (bias-corrected gyro) feeding ZUPT.
-    const ekf::Vec3 w_corr = w_b - filter.state().bg;
-    const bool still_now = w_corr.norm() < kStillGyroMax &&
-                           fabsf(f_b.norm() - ekf::kGravity) < kStillAccelTol;
-    if (still_now) {
-        if (still_counter < kStillCount) still_counter++;
+    bool stale = false;
+    if (mpu6050_read_sample(imu)) {
+        imu_fail_streak = 0;
     } else {
-        still_counter = 0;
-    }
-    if (still_counter >= kStillCount &&
-        (uint32_t)(t_us - last_zupt_us) >= kZuptPeriodUs) {
-        last_zupt_us = t_us;
-        filter.update_zupt();
+        stale = true;
+        imu_fail_count++;
+        imu_fail_streak++;
+        // One second of solid failures: the chip likely browned out or
+        // the bus wedged. Reconfigure and carry on; records keep flowing
+        // (flagged stale) either way.
+        if (imu_fail_streak >= 100) {
+            imu_fail_streak = 0;
+            mpu6050_reinit();
+        }
     }
 
-    // NaN is contagious and permanent: dump the filter and recalibrate.
-    if (!filter.healthy()) {
-        filter_resets++;
-        Serial.println("filter NaN -- resetting");
-        start_calibration();
+    const GpsState gps = gps_take();
+    if (gps.new_this_sample && gps.fix_valid && gps.have_utc) {
+        logger_note_first_fix(gps.utc_seconds, t_us);
     }
+
+    sample_t s;
+    s.t_us = t_us;
+    for (int i = 0; i < 3; i++) s.accel[i] = imu.accel[i];
+    for (int i = 0; i < 3; i++) s.gyro[i] = imu.gyro[i];
+    s.temp = imu.temp;
+    // seq increments per sample *taken*; a record dropped by a full ring
+    // buffer shows up on the card as a jump in seq.
+    s.seq = seq++;
+    s.flags = (gps.fix_valid ? SAMPLE_FLAG_FIX_VALID : 0) |
+              (gps.new_this_sample ? SAMPLE_FLAG_NEW_GPS : 0) |
+              (stale ? SAMPLE_FLAG_IMU_STALE : 0);
+    s.lat_e7 = gps.lat_e7;
+    s.lon_e7 = gps.lon_e7;
+    s.speed_cms = gps.speed_cms;
+    s.course_cdeg = gps.course_cdeg;
+    s.sats = gps.sats;
+    s.hdop_tenths = gps.hdop_tenths;
+
+    logger_push(s);
+    sample_count++;
 }
 
-static void print_telemetry()
+static void print_status()
 {
-    // Degrees only at this boundary -- everything upstream is rad.
-    // Casts to double are explicit: varargs would promote anyway and
-    // -Wdouble-promotion flags the implicit version.
-    const ekf::Vec3 rpy = filter.rpy() * kRadToDeg;
-    const ekf::Vec3 bg = filter.state().bg * kRadToDeg;
-    const ekf::Covariance& P = filter.covariance();
-    const float att_sd_deg =
-        sqrtf(P(ekf::kAtt, ekf::kAtt) + P(ekf::kAtt + 1, ekf::kAtt + 1)) *
-        kRadToDeg;
-    const uint32_t avg_us =
-        predict_count ? predict_us_sum / predict_count : 0;
-
-    char line[224];
+    char line[128];
     const int len = snprintf(
         line, sizeof(line),
-        "rpy %7.2f %7.2f %7.2f deg | bg %6.2f %6.2f %6.2f deg/s | "
-        "sd %5.2f | pred %lu/%lu us | acc %lu/%lu | %s | "
-        "rdfail %lu dtrej %lu rst %lu\r\n",
-        (double)rpy.x(), (double)rpy.y(), (double)rpy.z(),
-        (double)bg.x(), (double)bg.y(), (double)bg.z(),
-        (double)att_sd_deg,
-        (unsigned long)avg_us, (unsigned long)predict_us_max,
-        (unsigned long)filter.accel_updates_applied,
-        (unsigned long)filter.accel_updates_gated,
-        still_counter >= kStillCount ? "still" : "moving",
-        (unsigned long)read_failures, (unsigned long)dt_rejects,
-        (unsigned long)filter_resets);
-
-    predict_us_sum = 0;
-    predict_us_max = 0;
-    predict_count = 0;
-
-    // Telemetry is lowest priority: drop the line rather than block.
+        "n=%lu drop=%lu imu_err=%lu fix=%u sats=%u sd=%s\r\n",
+        (unsigned long)sample_count, (unsigned long)logger_dropped(),
+        (unsigned long)imu_fail_count,
+        (unsigned)(gps_peek().fix_valid ? 1 : 0), (unsigned)gps_peek().sats,
+        logger_ok() ? "ok" : "FAIL");
+    // Lowest priority output: drop the line rather than ever blocking.
     if (len > 0 && Serial.availableForWrite() >= len) {
         Serial.write((const uint8_t*)line, (size_t)len);
     }
 }
 
-// ---------------------------------------------------------------- arduino
-
 void setup()
 {
     Serial.begin(115200);
-    while (!Serial && millis() < 5000) {
-        // Wait for the USB CDC port, but never block when untethered.
+    while (!Serial && millis() < 3000) {
+        // Wait for USB, but never block when running headless on the car.
     }
-
     Serial.println();
-    Serial.println("longhorn baja firmware -- ESKF");
+    Serial.println("Baja Sensor ECU datalogger (MPU6050 + GT-U7)");
     if (watchdog_caused_reboot()) {
-        Serial.println("WARNING: last reset was the watchdog");
+        Serial.println("NOTE: recovering from a watchdog reset");
     }
 
-#if defined(ARDUINO_ARCH_RP2040) && !defined(ARDUINO_ARCH_MBED)
+    pinMode(kPinLed, OUTPUT);
+
     Wire.setSDA(kPinSda);
     Wire.setSCL(kPinScl);
-#endif
     Wire.begin();
-    Wire.setClock(400000);
+    Wire.setClock(kI2cHz);
 
-    if (probe_imu()) {
-        start_calibration();
-    } else {
-        Serial.println("MPU6050 not found -- retrying in background");
-        mode = Mode::kImuProbe;
+    if (!mpu6050_init(Wire, kMpuAddr)) {
+        Serial.println("FATAL: MPU6050 not responding (WHO_AM_I != 0x68). "
+                       "Check wiring/address/pull-ups. Halting.");
+        halt_blink(100, 100, 2, 800);  // double-flash pattern
     }
+    Serial.println("MPU6050 up: +/-16 g, +/-1000 deg/s, 44 Hz DLPF");
 
-    // Fed in exactly one place: the top of loop().
+    gps_begin();
+
+    // boot_id: hardware random, ties this power cycle's file(s) together.
+    const uint32_t boot_id = get_rand_32();
+    if (!logger_begin(boot_id, mpu6050_accel_fs_g(), mpu6050_gyro_fs_dps())) {
+        Serial.println("FATAL: no usable SD card. Halting.");
+        halt_blink(60, 60, 1, 0);  // fast continuous blink
+    }
+    Serial.print("logging, boot_id=");
+    Serial.println(boot_id, HEX);
+
+    // Armed only after init: the blocking bring-up above must not race a
+    // 4 s timeout. Fed in exactly one place, the top of loop().
     rp2040.wdt_begin(kWatchdogMs);
+
+    next_us = micros() + kSamplePeriodUs;
+    status_next_us = next_us;
 }
 
 void loop()
 {
     rp2040.wdt_reset();
 
-    const uint32_t now_us = micros();
+    // GPS bytes drain every pass so the UART FIFO never overflows.
+    gps_poll();
 
-    if (mode == Mode::kImuProbe) {
-        if (now_us - last_probe_us >= kInitRetryUs) {
-            last_probe_us += kInitRetryUs;
-            if (probe_imu()) start_calibration();
-        }
-        return;
+    // Deadline pattern, wrap-safe: signed test on the unsigned difference
+    // works across the 71-minute micros() rollover; a direct >= compare
+    // does not -- the bug that survives bench tests and then kills an
+    // endurance run.
+    if ((int32_t)(micros() - next_us) >= 0) {
+        next_us += kSamplePeriodUs;
+        take_sample();
     }
 
-    if (now_us - last_sample_us >= kSamplePeriodUs) {
-        last_sample_us += kSamplePeriodUs;  // preserves the timebase
+    logger_poll();
 
-        ekf::Vec3 f_b, w_b;
-        uint32_t t_us;
-        if (!read_imu(f_b, w_b, t_us)) {
-            read_failures++;
-            if (read_failures % 100 == 0) {
-                imu_configured = false;
-                mode = Mode::kImuProbe;  // bus is gone; re-probe
-            }
-            return;
-        }
-
-        if (mode == Mode::kCalibrating) {
-            calibration_step(f_b, w_b);
-        } else {
-            running_step(f_b, w_b, t_us);
-        }
-    }
-
-    if (mode == Mode::kRunning && now_us - last_telem_us >= kTelemPeriodUs) {
-        last_telem_us += kTelemPeriodUs;
-        print_telemetry();
+    if ((int32_t)(micros() - status_next_us) >= 0) {
+        status_next_us += kStatusPeriodUs;
+        // Heartbeat: steady 0.5 s toggle says the loop is alive.
+        digitalWrite(kPinLed, (millis() / 500) % 2 ? HIGH : LOW);
+        print_status();
     }
 }
