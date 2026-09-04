@@ -1,7 +1,22 @@
 #pragma once
 
+// Arduino's F() flash-string macro collides with Eigen's use of `F` as a
+// template parameter name (the preprocessor rewrites it everywhere).
+// Neutralize it around the Eigen includes and restore Arduino's
+// definition afterwards, so include order doesn't matter.
+#ifdef F
+#undef F
+#define EKF_RESTORE_ARDUINO_F
+#endif
+
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
+
+#ifdef EKF_RESTORE_ARDUINO_F
+#undef EKF_RESTORE_ARDUINO_F
+#define F(string_literal) \
+    (reinterpret_cast<const __FlashStringHelper *>(PSTR(string_literal)))
+#endif
 
 namespace ekf {
 
